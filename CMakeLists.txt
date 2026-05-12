@@ -26,3 +26,9 @@ add_executable(benchmark_multi_arena src/benchmark_multi_arena.cpp)
 target_link_libraries(benchmark_multi_arena PRIVATE packet_pool)
 target_compile_options(benchmark_multi_arena PRIVATE -O2 -pthread)
 target_link_options(benchmark_multi_arena PRIVATE -pthread)
+
+# Profiling build: keeps frame pointers so perf can unwind the stack
+add_executable(server_pool_prof src/server_pool.cpp)
+target_link_libraries(server_pool_prof PRIVATE packet_pool)
+target_compile_options(server_pool_prof PRIVATE -O2 -pthread -g -fno-omit-frame-pointer)
+target_link_options(server_pool_prof PRIVATE -pthread)
