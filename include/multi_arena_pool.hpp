@@ -1,21 +1,22 @@
 #pragma once
+
 #include "free_list.hpp"
-#include <array>
+
+#include <algorithm>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
-#include <new>
 #include <shared_mutex>
 #include <stdexcept>
+#include <thread>
+#include <vector>
 
 namespace pp
 {
     struct FragmentationStats
     {
-        static constexpr std::size_t MAX_ARENAS = 256;
-
         std::size_t total_blocks;
         std::size_t free_blocks;
         std::size_t occupied_blocks;
@@ -26,11 +27,13 @@ namespace pp
 
         struct PerArenaStats
         {
-            uint16_t arena_id;
+            std::uint64_t arena_uid;
+            std::thread::id owner_thread;
             std::size_t free_count;
             std::size_t occupied_count;
         };
-        std::array<PerArenaStats, MAX_ARENAS> per_arena_stats;
+
+        std::vector<PerArenaStats> per_arena_stats;
     };
 
     class MultiArenaPool
@@ -40,88 +43,151 @@ namespace pp
             void operator()(void *p) const noexcept { std::free(p); }
         };
 
+        struct BlockHeader
+        {
+            std::uint64_t arena_uid;
+        };
+
         struct Arena
         {
             std::unique_ptr<std::byte[], FreeDeleter> storage;
             FreeList free_list;
-            std::atomic<std::size_t> free_count{0};
-            std::size_t block_size;
-            std::size_t block_count;
-            uint16_t arena_id;
+            mutable std::shared_mutex mu;
+            std::atomic<std::size_t> occupied_count{0};
+            std::size_t block_count{0};
+            std::size_t block_stride{0};
+            std::uint64_t arena_uid{0};
+            std::thread::id owner_thread{};
         };
 
         static constexpr std::size_t MAX_ARENAS = 256;
-        std::array<Arena, MAX_ARENAS> arenas_;
-        std::size_t arena_count_{0};
+        inline static thread_local std::uint64_t tls_arena_uid_ = 0;
+
+        std::vector<std::unique_ptr<Arena>> arenas_;
         mutable std::shared_mutex arenas_mu_;
         std::size_t block_size_;
+        std::size_t block_header_size_;
+        std::size_t block_stride_;
         std::size_t initial_block_count_;
         std::size_t max_arenas_;
+        std::atomic<std::uint64_t> next_arena_uid_{1};
 
         static std::size_t round_up(std::size_t n, std::size_t align) noexcept
         {
             return (n + align - 1) & ~(align - 1);
         }
 
-        void create_arena(std::size_t block_count)
-        {
-            if (arena_count_ >= max_arenas_)
-                throw std::bad_alloc{};
-
-            Arena &arena = arenas_[arena_count_];
-            arena.block_size = block_size_;
-            arena.block_count = block_count;
-            arena.arena_id = arena_count_;
-
-            void *raw = std::aligned_alloc(alignof(std::max_align_t),
-                                           block_size_ * block_count);
-            if (!raw)
-                throw std::bad_alloc{};
-            arena.storage.reset(static_cast<std::byte *>(raw));
-
-            for (std::size_t i = 0; i < block_count; ++i)
-            {
-                std::byte *block = arena.storage.get() + i * block_size_;
-                Node *node = reinterpret_cast<Node *>(block);
-                node->arena_id = arena.arena_id;
-                arena.free_list.push(block);
-            }
-
-            arena.free_count.store(block_count, std::memory_order_relaxed);
-            ++arena_count_;
-        }
-
-        Arena *allocate_from_arena(Arena *arena)
-        {
-            void *p = arena->free_list.pop();
-            if (p)
-            {
-                arena->free_count.fetch_sub(1, std::memory_order_relaxed);
-                return arena;
-            }
-            return nullptr;
-        }
-
-        std::size_t compute_next_block_count(std::size_t last_count) const noexcept
+        std::size_t next_block_count(std::size_t last_count) const noexcept
         {
             return last_count == 0 ? initial_block_count_ : last_count * 2;
         }
 
+        Arena *find_arena_by_uid_unlocked(std::uint64_t uid) const noexcept
+        {
+            for (const auto &arena : arenas_)
+            {
+                if (arena && arena->arena_uid == uid)
+                    return arena.get();
+            }
+            return nullptr;
+        }
+
+        std::vector<std::unique_ptr<Arena>>::iterator find_arena_it_unlocked(
+            std::uint64_t uid)
+        {
+            return std::find_if(
+                arenas_.begin(), arenas_.end(),
+                [uid](const std::unique_ptr<Arena> &arena)
+                {
+                    return arena && arena->arena_uid == uid;
+                });
+        }
+
+        Arena *create_arena_unlocked(std::size_t block_count,
+                                     std::thread::id owner_thread)
+        {
+            if (arenas_.size() >= max_arenas_)
+                throw std::bad_alloc{};
+
+            auto arena = std::make_unique<Arena>();
+            arena->block_count = block_count;
+            arena->block_stride = block_stride_;
+            arena->arena_uid = next_arena_uid_.fetch_add(1, std::memory_order_relaxed);
+            arena->owner_thread = owner_thread;
+
+            void *raw = std::aligned_alloc(alignof(std::max_align_t),
+                                           arena->block_stride * block_count);
+            if (!raw)
+                throw std::bad_alloc{};
+            arena->storage.reset(static_cast<std::byte *>(raw));
+
+            for (std::size_t i = 0; i < block_count; ++i)
+            {
+                std::byte *base = arena->storage.get() + i * arena->block_stride;
+                auto *header = reinterpret_cast<BlockHeader *>(base);
+                header->arena_uid = arena->arena_uid;
+                arena->free_list.push(base);
+            }
+
+            arena->occupied_count.store(0, std::memory_order_relaxed);
+
+            Arena *result = arena.get();
+            arenas_.push_back(std::move(arena));
+            return result;
+        }
+
+        void *try_allocate_from_arena(Arena &arena)
+        {
+            std::shared_lock arena_lock(arena.mu);
+            void *base = arena.free_list.pop();
+            if (!base)
+                return nullptr;
+
+            arena.occupied_count.fetch_add(1, std::memory_order_relaxed);
+            auto *header = static_cast<BlockHeader *>(base);
+            header->arena_uid = arena.arena_uid;
+            return reinterpret_cast<std::byte *>(base) + block_header_size_;
+        }
+
+        void remove_arena_if_empty(std::uint64_t arena_uid)
+        {
+            std::unique_lock global_lock(arenas_mu_);
+            auto it = find_arena_it_unlocked(arena_uid);
+            if (it == arenas_.end())
+                return;
+
+            Arena &arena = *(*it);
+            std::unique_lock arena_lock(arena.mu);
+            if (arena.occupied_count.load(std::memory_order_relaxed) != 0)
+                return;
+
+            if (tls_arena_uid_ == arena_uid)
+                tls_arena_uid_ = 0;
+
+            arenas_.erase(it);
+        }
+
     public:
         MultiArenaPool(std::size_t block_size, std::size_t initial_block_count,
-                       std::size_t max_arenas = 256)
-            : block_size_(round_up(
-                  std::max(block_size, sizeof(Node)),
-                  alignof(std::max_align_t))),
-              initial_block_count_(
-                  initial_block_count == 0 ? 1 : initial_block_count),
-              max_arenas_(max_arenas > MAX_ARENAS ? MAX_ARENAS : max_arenas)
+                       std::size_t max_arenas = MAX_ARENAS)
+            : block_size_(round_up(std::max(block_size, sizeof(Node)),
+                                   alignof(std::max_align_t))),
+              block_header_size_(round_up(std::max(sizeof(BlockHeader), sizeof(Node)),
+                                          alignof(std::max_align_t))),
+              block_stride_(0),
+              initial_block_count_(initial_block_count == 0 ? 1 : initial_block_count),
+              max_arenas_(std::min(max_arenas, MAX_ARENAS))
         {
             if (max_arenas_ == 0)
                 throw std::invalid_argument("max_arenas must be > 0");
 
-            std::lock_guard lk(arenas_mu_);
-            create_arena(initial_block_count_);
+            block_stride_ = round_up(block_header_size_ + block_size_,
+                                     alignof(std::max_align_t));
+
+            std::unique_lock lock(arenas_mu_);
+            Arena *primary = create_arena_unlocked(initial_block_count_,
+                                                   std::this_thread::get_id());
+            tls_arena_uid_ = primary->arena_uid;
         }
 
         MultiArenaPool(const MultiArenaPool &) = delete;
@@ -130,48 +196,56 @@ namespace pp
 
         [[nodiscard]] void *allocate()
         {
+            const std::thread::id this_thread = std::this_thread::get_id();
+
+            if (tls_arena_uid_ != 0)
             {
-                std::shared_lock lk(arenas_mu_);
-                for (std::size_t i = 0; i < arena_count_; ++i)
+                std::shared_lock lock(arenas_mu_);
+                Arena *arena = find_arena_by_uid_unlocked(tls_arena_uid_);
+                if (arena && arena->owner_thread == this_thread)
                 {
-                    void *p = arenas_[i].free_list.pop();
-                    if (p)
+                    if (void *p = try_allocate_from_arena(*arena))
+                        return p;
+                }
+            }
+
+            {
+                std::shared_lock lock(arenas_mu_);
+                for (const auto &arena_ptr : arenas_)
+                {
+                    Arena &arena = *arena_ptr;
+                    if (arena.owner_thread != this_thread)
+                        continue;
+                    if (void *p = try_allocate_from_arena(arena))
                     {
-                        arenas_[i].free_count.fetch_sub(1,
-                                                        std::memory_order_relaxed);
+                        tls_arena_uid_ = arena.arena_uid;
                         return p;
                     }
                 }
             }
+
+            std::unique_lock lock(arenas_mu_);
+
+            if (tls_arena_uid_ != 0)
             {
-                std::unique_lock lk(arenas_mu_);
-
-                for (std::size_t i = 0; i < arena_count_; ++i)
+                Arena *current = find_arena_by_uid_unlocked(tls_arena_uid_);
+                if (current && current->owner_thread == this_thread)
                 {
-                    void *p = arenas_[i].free_list.pop();
-                    if (p)
-                    {
-                        arenas_[i].free_count.fetch_sub(1,
-                                                        std::memory_order_relaxed);
+                    if (void *p = try_allocate_from_arena(*current))
                         return p;
-                    }
-                }
 
-                if (arena_count_ >= max_arenas_)
-                    throw std::bad_alloc{};
-
-                std::size_t next_size = compute_next_block_count(
-                    arenas_[arena_count_ - 1].block_count);
-                create_arena(next_size);
-
-                void *p = arenas_[arena_count_ - 1].free_list.pop();
-                if (p)
-                {
-                    arenas_[arena_count_ - 1].free_count.fetch_sub(
-                        1, std::memory_order_relaxed);
-                    return p;
+                    std::size_t next_count = next_block_count(current->block_count);
+                    Arena *created = create_arena_unlocked(next_count, this_thread);
+                    tls_arena_uid_ = created->arena_uid;
+                    if (void *p = try_allocate_from_arena(*created))
+                        return p;
                 }
             }
+
+            Arena *created = create_arena_unlocked(initial_block_count_, this_thread);
+            tls_arena_uid_ = created->arena_uid;
+            if (void *p = try_allocate_from_arena(*created))
+                return p;
 
             throw std::bad_alloc{};
         }
@@ -181,48 +255,51 @@ namespace pp
             if (!p)
                 return;
 
-            Node *node = static_cast<Node *>(p);
-            uint16_t arena_id = node->arena_id;
+            std::byte *payload = static_cast<std::byte *>(p);
+            auto *header = reinterpret_cast<BlockHeader *>(payload - block_header_size_);
+            std::uint64_t arena_uid = header->arena_uid;
 
             {
-                std::shared_lock lk(arenas_mu_);
-                if (arena_id < arena_count_)
-                {
-                    arenas_[arena_id].free_list.push(p);
-                    arenas_[arena_id].free_count.fetch_add(
-                        1, std::memory_order_relaxed);
-                }
+                std::shared_lock lock(arenas_mu_);
+                Arena *arena = find_arena_by_uid_unlocked(arena_uid);
+                if (!arena)
+                    return;
+
+                std::shared_lock arena_lock(arena->mu);
+                arena->free_list.push(payload - block_header_size_);
+                std::size_t previous = arena->occupied_count.fetch_sub(
+                    1, std::memory_order_relaxed);
+                if (previous != 1)
+                    return;
             }
+
+            remove_arena_if_empty(arena_uid);
         }
 
         FragmentationStats get_fragmentation_stats() const
         {
             FragmentationStats stats{};
-            stats.total_blocks = 0;
-            stats.free_blocks = 0;
-            stats.occupied_blocks = 0;
 
+            std::shared_lock lock(arenas_mu_);
+            stats.num_arenas = arenas_.size();
+            stats.per_arena_stats.reserve(arenas_.size());
+
+            for (const auto &arena_ptr : arenas_)
             {
-                std::shared_lock lk(arenas_mu_);
-                stats.num_arenas = arena_count_;
+                const Arena &arena = *arena_ptr;
+                std::size_t occupied = arena.occupied_count.load(std::memory_order_relaxed);
+                std::size_t free = arena.block_count - occupied;
 
-                for (std::size_t i = 0; i < arena_count_; ++i)
-                {
-                    const Arena &arena = arenas_[i];
-                    std::size_t free = arena.free_count.load(
-                        std::memory_order_relaxed);
-                    std::size_t occupied = arena.block_count - free;
+                stats.total_blocks += arena.block_count;
+                stats.free_blocks += free;
+                stats.occupied_blocks += occupied;
 
-                    stats.total_blocks += arena.block_count;
-                    stats.free_blocks += free;
-                    stats.occupied_blocks += occupied;
-
-                    FragmentationStats::PerArenaStats per_arena;
-                    per_arena.arena_id = arena.arena_id;
-                    per_arena.free_count = free;
-                    per_arena.occupied_count = occupied;
-                    stats.per_arena_stats[i] = per_arena;
-                }
+                FragmentationStats::PerArenaStats per_arena{};
+                per_arena.arena_uid = arena.arena_uid;
+                per_arena.owner_thread = arena.owner_thread;
+                per_arena.free_count = free;
+                per_arena.occupied_count = occupied;
+                stats.per_arena_stats.push_back(per_arena);
             }
 
             stats.fragmentation_ratio =
@@ -249,7 +326,7 @@ namespace pp
             }
             if (new_size <= block_size_)
                 return old_ptr;
-            // new_size > block_size_: allocate new block, copy, free old
+
             void *new_ptr = allocate();
             std::memcpy(new_ptr, old_ptr, block_size_);
             deallocate(old_ptr);
@@ -258,24 +335,39 @@ namespace pp
 
         void compact()
         {
-            // Since we use a fixed-size preallocated array, empty arenas are kept
-            // but skipped during allocation. No heap deallocation is performed.
-            // This is a no-op to maintain API compatibility.
+            std::unique_lock lock(arenas_mu_);
+            auto it = arenas_.begin();
+            while (it != arenas_.end())
+            {
+                Arena &arena = *(*it);
+                std::unique_lock arena_lock(arena.mu);
+                if (arena.occupied_count.load(std::memory_order_relaxed) == 0)
+                {
+                    if (tls_arena_uid_ == arena.arena_uid)
+                        tls_arena_uid_ = 0;
+                    it = arenas_.erase(it);
+                }
+                else
+                {
+                    ++it;
+                }
+            }
         }
 
         std::size_t arena_count() const noexcept
         {
-            std::shared_lock lk(arenas_mu_);
-            return arena_count_;
+            std::shared_lock lock(arenas_mu_);
+            return arenas_.size();
         }
 
         std::size_t block_size() const noexcept { return block_size_; }
+
         std::size_t total_block_count() const noexcept
         {
-            std::shared_lock lk(arenas_mu_);
+            std::shared_lock lock(arenas_mu_);
             std::size_t total = 0;
-            for (std::size_t i = 0; i < arena_count_; ++i)
-                total += arenas_[i].block_count;
+            for (const auto &arena_ptr : arenas_)
+                total += arena_ptr->block_count;
             return total;
         }
     };
