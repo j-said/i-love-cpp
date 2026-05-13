@@ -263,22 +263,21 @@ static void performance_test()
 
     std::latch ready(static_cast<std::ptrdiff_t>(NUM_THREADS) + 1);
 
-    ready.arrive_and_wait();
-    auto t0 = Clock::now();
-
     std::vector<std::thread> threads;
     for (std::size_t t = 0; t < NUM_THREADS; ++t)
     {
         threads.emplace_back([&]
-        {
+                             {
             ready.arrive_and_wait();
             for (std::size_t i = 0; i < OPS_PER_THREAD; ++i)
             {
                 void *p = pool.allocate();
                 pool.deallocate(p);
-            }
-        });
+            } });
     }
+
+    ready.arrive_and_wait();
+    auto t0 = Clock::now();
 
     for (auto &t : threads)
         t.join();
@@ -304,6 +303,7 @@ int main()
         arena_lifecycle_test();
         multithreaded_test();
         stl_test();
+        performance_test();
 
         std::cout << "\n" << std::string(70, '=')
                   << "\n✓ All tests completed successfully\n"

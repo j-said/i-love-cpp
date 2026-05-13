@@ -22,7 +22,7 @@ static const char REQUEST[] =
     "Host: localhost\r\n"
     "Content-Type: application/json\r\n"
     "\r\n"
-    "{\"command\": \"echo ok\"}";
+    "{\"command\": \"ls ~ grep c\"}";
 
 static bool do_request(const char* host, int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);

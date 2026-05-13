@@ -70,6 +70,7 @@ All tests included in `benchmark_multi_arena`:
 - Arena lifecycle (creation/removal)
 - Multi-threaded stress (8 threads, 8000 allocs)
 - STL vector integration
+- Performance comparison for the multi-arena allocator
 
 Run all tests: `./build/benchmark_multi_arena`
 
@@ -93,7 +94,7 @@ Run all tests: `./build/benchmark_multi_arena`
 - `include/free_list.hpp` — Lock-free LIFO list with ABA tagging
 - `src/server_pool.cpp` — Thread-pool server (8 workers + epoll)
 - `src/benchmark.cpp` — Single-arena vs malloc comparison
-- `src/benchmark_multi_arena.cpp` — Multi-arena test suite
+- `src/benchmark_multi_arena.cpp` — Multi-arena test suite + performance comparison
 - `src/stress.cpp` — Server load generator
 
 ## Notes

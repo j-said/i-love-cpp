@@ -60,7 +60,7 @@ namespace pp
             std::thread::id owner_thread{};
         };
 
-        static constexpr std::size_t MAX_ARENAS = 256;
+        static constexpr std::size_t MAX_ARENAS = 16;
         inline static thread_local std::uint64_t tls_arena_uid_ = 0;
 
         std::vector<std::unique_ptr<Arena>> arenas_;
