@@ -2,11 +2,13 @@
 #include <array>
 #include <condition_variable>
 #include <cstring>
+#include <future>
 #include <iostream>
 #include <mutex>
 #include <queue>
 #include <thread>
 #include <vector>
+#include <cerrno>
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -153,10 +155,13 @@ int main() {
     pp::PacketPool pool(BUFFER_SIZE, N_WORKERS);
     WorkQueue      queue;
 
-    std::vector<std::thread> workers;
+    std::vector<std::future<void>> workers;
     workers.reserve(N_WORKERS);
-    for (int i = 0; i < N_WORKERS; ++i)
-        workers.emplace_back(worker, std::ref(pool), std::ref(queue));
+    for (int i = 0; i < N_WORKERS; ++i) {
+        workers.emplace_back(std::async(std::launch::async, [&pool, &queue] {
+            worker(pool, queue);
+        }));
+    }
 
     int srv = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     int opt = 1;
@@ -182,19 +187,30 @@ int main() {
     std::array<epoll_event, MAX_EVENTS> events;
     while (true) {
         int n = epoll_wait(epfd, events.data(), MAX_EVENTS, -1);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+
         for (int i = 0; i < n; ++i) {
             while (true) {
                 int client = accept4(srv, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
-                if (client < 0) break;
-                int flags = fcntl(client, F_GETFL);
-                fcntl(client, F_SETFL, flags & ~O_NONBLOCK);
-                queue.push(client);
+                if (client >= 0) {
+                    int flags = fcntl(client, F_GETFL);
+                    fcntl(client, F_SETFL, flags & ~O_NONBLOCK);
+                    queue.push(client);
+                    continue;
+                }
+
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                break;
             }
         }
     }
 
     queue.shutdown();
-    for (auto& t : workers) t.join();
+    for (auto& f : workers) f.get();
     close(epfd);
     close(srv);
 }
